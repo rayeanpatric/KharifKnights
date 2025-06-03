@@ -1,0 +1,88 @@
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 220 30% 8%;
+    --foreground: 210 40% 98%;
+
+    --card: 220 30% 10%;
+    --card-foreground: 210 40% 98%;
+
+    --popover: 220 30% 8%;
+    --popover-foreground: 210 40% 98%;
+
+    --primary: 142 85% 43%;
+    --primary-foreground: 220 30% 8%;
+
+    --secondary: 217.2 32.6% 17.5%;
+    --secondary-foreground: 210 40% 98%;
+
+    --muted: 217.2 32.6% 17.5%;
+    --muted-foreground: 215 20.2% 65.1%;
+
+    --accent: 217.2 32.6% 17.5%;
+    --accent-foreground: 210 40% 98%;
+
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 210 40% 98%;
+
+    --border: 220 30% 15%;
+    --input: 217.2 32.6% 17.5%;
+    --ring: 142 85% 43%;
+
+    --radius: 0.5rem;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-e-dark text-foreground;
+  }
+}
+
+:root {
+  --e-dark: #10141e;
+  --e-dark-accent: #161a26;
+  --e-green: #36d399;
+  --e-blue: #38bdf8;
+  --e-yellow: #fbbf24;
+}
+
+.bg-e-dark {
+  background-color: var(--e-dark);
+}
+
+.bg-e-dark-accent {
+  background-color: var(--e-dark-accent);
+}
+
+.text-e-green {
+  color: var(--e-green);
+}
+
+.bg-e-green {
+  background-color: var(--e-green);
+}
+
+.text-e-blue {
+  color: var(--e-blue);
+}
+
+.bg-e-blue {
+  background-color: var(--e-blue);
+}
+
+.text-e-yellow {
+  color: var(--e-yellow);
+}
+
+.bg-e-yellow {
+  background-color: var(--e-yellow);
+}
