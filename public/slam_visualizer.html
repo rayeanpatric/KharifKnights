@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SLAM 3D Visualization</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #f0f0f0; font-family: monospace; }
+        canvas { display: block; }
+        #infoPanel {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background-color: rgba(0, 0, 0, 0.6);
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            font-size: 12px;
+            z-index: 100;
+        }
+        #infoPanel div { margin-bottom: 5px; }
+    </style>
+</head>
+<body>
+    <div id="infoPanel">
+        <div>Frame: <span id="frameCount">0</span></div>
+        <div>Position: <span id="robotPosition">(0.00, 0.00, 0.00)</span></div>
+        <div>Features: <span id="featureCount">0</span></div>
+    </div>
+
+    <!-- Canvas will be added here by Three.js -->
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.163.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.163.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- Configuration ---
+        const MAX_TRAJECTORY_POINTS = 10000;
+        const MAX_FEATURE_POINTS = 30000;
+        const DRONE_SPEED = 0.1;
+        const FEATURE_GENERATION_RATE = 8;
+        const FEATURE_RANGE = 8;
+        const FEATURE_JITTER = 0.15;
+        const LOOP_CLOSURE_CHANCE = 0.003;
+        const DRONE_HOVER_HEIGHT = 1.5; // Normal flying height
+        const DRONE_SIZE = { width: 0.5, height: 0.1, depth: 0.4 };
+
+        // Field Scan Configuration
+        const FIELD_WIDTH = 20;
+        const FIELD_DEPTH = 15;
+        const SCAN_WIDTH = 1.0;
+        const START_CORNER = new THREE.Vector3(-FIELD_WIDTH / 2, DRONE_HOVER_HEIGHT, -FIELD_DEPTH / 2);
+        const MOVEMENT_THRESHOLD = DRONE_SPEED * 0.5;
+
+        // Obstacle Configuration
+        const NUM_OBSTACLES = 10;
+        const OBSTACLE_MAX_SIZE = { width: 2.0, height: 2.5, depth: 2.0 }; // Max height added
+        const OBSTACLE_MIN_SIZE = { width: 0.5, height: 0.5, depth: 0.5 };
+        const OBSTACLE_COLOR = 0x8B4513; // Brown
+        const AVOIDANCE_LOOKAHEAD_DISTANCE = DRONE_SIZE.depth * 4; // How far ahead to check
+        const AVOIDANCE_SAFETY_MARGIN = 0.5; // Extra height clearance
+
+        // Movement States
+        const STATE = {
+            MOVING_X_POS: 0,
+            MOVING_X_NEG: 1,
+            TURNING_Z: 2,
+            FINISHED: 3,
+        };
+        let currentMovementState = STATE.MOVING_X_POS;
+        let currentTargetPosition = new THREE.Vector3(); // The ideal lawnmower target
+        let currentScanZ = START_CORNER.z;
+
+        // Avoidance State
+        let isAvoiding = false;
+        let avoidanceTargetY = DRONE_HOVER_HEIGHT;
+        let obstacleToAvoid = null;
+
+        // --- Scene Setup ---
+        let scene, camera, renderer, controls;
+        let ambientLight, directionalLight;
+        let clock;
+        let frameCounter = 0;
+
+        // --- Drone ---
+        let droneMesh;
+        let dronePosition = new THREE.Vector3().copy(START_CORNER);
+
+        // --- Obstacles ---
+        let obstacles = []; // Array to hold { mesh, position, size }
+
+        // --- SLAM Data ---
+        let trajectoryGeometry, trajectoryMaterial, trajectoryLine, trajectoryPositions, trajectoryPointCount = 0;
+        let featuresGeometry, featuresMaterial, featuresPoints, featuresPositions, featuresColors, featurePointCount = 0;
+        let loopClosureGroup;
+
+        // --- UI Elements ---
+        // Get references after DOM is loaded (within init or later)
+        let frameCountElement, robotPositionElement, featureCountElement;
+
+        // --- Initialization ---
+        function init() {
+            // Get UI elements now that DOM is ready
+            frameCountElement = document.getElementById('frameCount');
+            robotPositionElement = document.getElementById('robotPosition');
+            featureCountElement = document.getElementById('featureCount');
+
+            // Scene
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x87CEEB); // Sky blue background
+            scene.fog = new THREE.Fog(0x87CEEB, 20, 70); // Add some fog
+
+            // Camera
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, FIELD_DEPTH, FIELD_DEPTH * 1.2); // Adjusted starting view
+            camera.lookAt(0, 0, 0);
+
+            // Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            document.body.appendChild(renderer.domElement); // Append canvas to body
+
+            // Clock
+            clock = new THREE.Clock();
+
+            // Lighting
+            ambientLight = new THREE.AmbientLight(0xaaaaaa); // Brighter ambient light
+            scene.add(ambientLight);
+
+            directionalLight = new THREE.DirectionalLight(0xffffff, 1.0); // Slightly stronger sun
+            directionalLight.position.set(FIELD_WIDTH * 0.5, 30, FIELD_DEPTH * 0.5);
+            directionalLight.castShadow = true;
+            directionalLight.shadow.mapSize.width = 2048; // Higher res shadow map
+            directionalLight.shadow.mapSize.height = 2048;
+            directionalLight.shadow.camera.near = 0.5;
+            directionalLight.shadow.camera.far = 100;
+            directionalLight.shadow.camera.left = -FIELD_WIDTH;
+            directionalLight.shadow.camera.right = FIELD_WIDTH;
+            directionalLight.shadow.camera.top = FIELD_DEPTH;
+            directionalLight.shadow.camera.bottom = -FIELD_DEPTH;
+            scene.add(directionalLight);
+
+
+            // Controls
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.screenSpacePanning = false;
+            controls.minDistance = 2;
+            controls.maxDistance = 60;
+            controls.maxPolarAngle = Math.PI / 2 - 0.01;
+
+            // Ground Plane
+            const groundGeometry = new THREE.PlaneGeometry(FIELD_WIDTH * 1.5, FIELD_DEPTH * 1.5);
+            const groundMaterial = new THREE.MeshStandardMaterial({ color: 0x55aa55, side: THREE.DoubleSide });
+            const groundPlane = new THREE.Mesh(groundGeometry, groundMaterial);
+            groundPlane.rotation.x = -Math.PI / 2;
+            groundPlane.position.y = -0.05;
+            groundPlane.receiveShadow = true;
+            scene.add(groundPlane);
+
+            // Grid Helper
+            const gridHelper = new THREE.GridHelper(Math.max(FIELD_WIDTH, FIELD_DEPTH), Math.max(FIELD_WIDTH, FIELD_DEPTH) / 2, 0xcccccc, 0xcccccc);
+            gridHelper.position.y = 0;
+            scene.add(gridHelper);
+
+            // Initialize Drone
+            createDrone();
+
+            // Initialize Obstacles
+            createObstacles();
+
+            // Initialize Trajectory
+            createTrajectory();
+
+            // Initialize Features (Point Cloud)
+            createFeatures();
+
+            // Group for Loop Closures
+            loopClosureGroup = new THREE.Group();
+            scene.add(loopClosureGroup);
+
+            // Set initial target for movement
+            setNextLawnmowerTarget();
+
+            // Handle Window Resize
+            window.addEventListener('resize', onWindowResize, false);
+
+            // Start Animation
+            animate();
+        }
+
+        // --- Object Creation ---
+        function createDrone() {
+            const droneGeometry = new THREE.BoxGeometry(DRONE_SIZE.width, DRONE_SIZE.height, DRONE_SIZE.depth);
+            const droneMaterial = new THREE.MeshStandardMaterial({
+                color: 0xeeeeee, // Light Grey / White
+                metalness: 0.3,
+                roughness: 0.7
+            });
+            droneMesh = new THREE.Mesh(droneGeometry, droneMaterial);
+            droneMesh.castShadow = true;
+            droneMesh.receiveShadow = false;
+            droneMesh.position.copy(dronePosition);
+            scene.add(droneMesh);
+        }
+
+        function createObstacles() {
+            const obstacleMaterial = new THREE.MeshStandardMaterial({
+                color: OBSTACLE_COLOR,
+                metalness: 0.1,
+                roughness: 0.9
+            });
+
+            for (let i = 0; i < NUM_OBSTACLES; i++) {
+                const size = new THREE.Vector3(
+                    THREE.MathUtils.randFloat(OBSTACLE_MIN_SIZE.width, OBSTACLE_MAX_SIZE.width),
+                    THREE.MathUtils.randFloat(OBSTACLE_MIN_SIZE.height, OBSTACLE_MAX_SIZE.height),
+                    THREE.MathUtils.randFloat(OBSTACLE_MIN_SIZE.depth, OBSTACLE_MAX_SIZE.depth)
+                );
+
+                const position = new THREE.Vector3(
+                    THREE.MathUtils.randFloat(-FIELD_WIDTH / 2 + size.x, FIELD_WIDTH / 2 - size.x),
+                    size.y / 2, // Place bottom on the ground (y=0)
+                    THREE.MathUtils.randFloat(-FIELD_DEPTH / 2 + size.z, FIELD_DEPTH / 2 - size.z)
+                );
+
+                // Avoid placing obstacles too close to start/end Z lines initially
+                if (Math.abs(position.z - START_CORNER.z) < SCAN_WIDTH || Math.abs(position.z - (FIELD_DEPTH / 2)) < SCAN_WIDTH) {
+                     // Try placing again if too close to start/end Z
+                     i--;
+                     continue;
+                }
+
+
+                const geometry = new THREE.BoxGeometry(size.x, size.y, size.z);
+                const mesh = new THREE.Mesh(geometry, obstacleMaterial);
+                mesh.position.copy(position);
+                mesh.castShadow = true;
+                mesh.receiveShadow = true;
+
+                scene.add(mesh);
+                obstacles.push({ mesh, position, size });
+            }
+        }
+
+        function createTrajectory() {
+            trajectoryGeometry = new THREE.BufferGeometry();
+            trajectoryPositions = new Float32Array(MAX_TRAJECTORY_POINTS * 3);
+            trajectoryGeometry.setAttribute('position', new THREE.BufferAttribute(trajectoryPositions, 3));
+            trajectoryMaterial = new THREE.LineBasicMaterial({ color: 0xff8800 }); // Orange trajectory
+            trajectoryLine = new THREE.Line(trajectoryGeometry, trajectoryMaterial);
+            trajectoryLine.frustumCulled = false;
+            updateTrajectoryBuffer(); // Add first point
+            trajectoryGeometry.setDrawRange(0, trajectoryPointCount);
+            scene.add(trajectoryLine);
+        }
+
+        function createFeatures() {
+            featuresGeometry = new THREE.BufferGeometry();
+            featuresPositions = new Float32Array(MAX_FEATURE_POINTS * 3);
+            featuresColors = new Float32Array(MAX_FEATURE_POINTS * 3);
+            featuresGeometry.setAttribute('position', new THREE.BufferAttribute(featuresPositions, 3));
+            featuresGeometry.setAttribute('color', new THREE.BufferAttribute(featuresColors, 3));
+            featuresMaterial = new THREE.PointsMaterial({ size: 0.06, vertexColors: true, sizeAttenuation: true });
+            featuresPoints = new THREE.Points(featuresGeometry, featuresMaterial);
+            featuresPoints.frustumCulled = false;
+            scene.add(featuresPoints);
+        }
+
+        // --- Collision Detection ---
+        function isPointInsideObstacle(point) {
+            for (const obs of obstacles) {
+                const halfSize = obs.size.clone().multiplyScalar(0.5);
+                const min = obs.position.clone().sub(halfSize);
+                const max = obs.position.clone().add(halfSize);
+
+                if (point.x >= min.x && point.x <= max.x &&
+                    point.y >= min.y && point.y <= max.y && // Check Y as well
+                    point.z >= min.z && point.z <= max.z) {
+                    return obs; // Return the obstacle object if collision
+                }
+            }
+            return null; // No collision
+        }
+
+        // --- Movement Logic ---
+
+        function setNextLawnmowerTarget() {
+            switch (currentMovementState) {
+                case STATE.MOVING_X_POS:
+                    currentTargetPosition.set(FIELD_WIDTH / 2, DRONE_HOVER_HEIGHT, currentScanZ);
+                    break;
+                case STATE.MOVING_X_NEG:
+                    currentTargetPosition.set(-FIELD_WIDTH / 2, DRONE_HOVER_HEIGHT, currentScanZ);
+                    break;
+                case STATE.TURNING_Z:
+                    const nextX = (currentScanZ - START_CORNER.z) / SCAN_WIDTH % 2 === 0 ? FIELD_WIDTH / 2 : -FIELD_WIDTH / 2;
+                     // Target Z is the *next* scan line
+                    currentTargetPosition.set(nextX, DRONE_HOVER_HEIGHT, currentScanZ + SCAN_WIDTH);
+                    break;
+                case STATE.FINISHED:
+                     console.log("Field Scan Finished");
+                    break;
+            }
+        }
+
+
+        function updateDroneMovement(deltaTime) {
+            if (currentMovementState === STATE.FINISHED) {
+                return;
+            }
+
+            // 1. Determine Current Ideal Direction & Target
+            // Target Y depends on whether we are avoiding or not.
+            let effectiveTargetY = isAvoiding ? avoidanceTargetY : DRONE_HOVER_HEIGHT;
+            const targetPosThisFrame = new THREE.Vector3(currentTargetPosition.x, effectiveTargetY, currentTargetPosition.z);
+            const directionToTarget = new THREE.Vector3().subVectors(targetPosThisFrame, dronePosition);
+            let distanceToTarget = directionToTarget.length(); // Distance to potentially elevated target
+
+            // 2. Check for Obstacles Ahead (only if not already avoiding)
+            if (!isAvoiding && distanceToTarget > 0.1) { // Don't check if already very close
+                const lookAheadDir = directionToTarget.clone().normalize();
+                const lookAheadPoint = dronePosition.clone().add(lookAheadDir.multiplyScalar(AVOIDANCE_LOOKAHEAD_DISTANCE));
+                lookAheadPoint.y = DRONE_HOVER_HEIGHT; // Check collision at normal flight height
+
+                const detectedObstacle = isPointInsideObstacle(lookAheadPoint);
+
+                if (detectedObstacle && detectedObstacle.position.y + detectedObstacle.size.y/2 > DRONE_HOVER_HEIGHT * 0.8) { // Only avoid if tall enough
+                    isAvoiding = true;
+                    obstacleToAvoid = detectedObstacle;
+                    // Calculate height needed to clear the specific obstacle
+                    avoidanceTargetY = obstacleToAvoid.position.y + obstacleToAvoid.size.y / 2 + AVOIDANCE_SAFETY_MARGIN;
+                    console.log("Avoiding obstacle! New target Y:", avoidanceTargetY);
+                    // Recalculate target Y for this frame
+                    effectiveTargetY = avoidanceTargetY;
+                    targetPosThisFrame.y = effectiveTargetY;
+                    directionToTarget.subVectors(targetPosThisFrame, dronePosition); // Update direction vector
+                    distanceToTarget = directionToTarget.length(); // Update distance
+                }
+            }
+
+            // 3. Check if Avoidance is Complete (if currently avoiding)
+            if (isAvoiding && obstacleToAvoid) {
+                let passed = false;
+                const buffer = droneMesh.geometry.parameters.depth / 2 + 0.1; // Drone size buffer
+
+                // Check if drone center passed the obstacle extent based on movement direction
+                if (currentMovementState === STATE.MOVING_X_POS && dronePosition.x > obstacleToAvoid.position.x + obstacleToAvoid.size.x / 2 + buffer) {
+                    passed = true;
+                } else if (currentMovementState === STATE.MOVING_X_NEG && dronePosition.x < obstacleToAvoid.position.x - obstacleToAvoid.size.x / 2 - buffer) {
+                    passed = true;
+                } else if (currentMovementState === STATE.TURNING_Z && dronePosition.z > obstacleToAvoid.position.z + obstacleToAvoid.size.z / 2 + buffer) {
+                    passed = true;
+                }
+                // Add more checks if drone could move diagonally or purely vertically in other scenarios
+
+                if (passed) {
+                    console.log("Passed obstacle.");
+                    isAvoiding = false;
+                    obstacleToAvoid = null;
+                    avoidanceTargetY = DRONE_HOVER_HEIGHT; // Reset target Y for future moves
+                    // Recalculate target Y for this frame - start descending
+                    effectiveTargetY = DRONE_HOVER_HEIGHT;
+                    targetPosThisFrame.y = effectiveTargetY;
+                    directionToTarget.subVectors(targetPosThisFrame, dronePosition); // Update direction vector
+                    distanceToTarget = directionToTarget.length(); // Update distance
+                }
+            }
+
+            // 4. Check if Lawnmower Target Reached (only if NOT avoiding)
+            // Use distance to the XZ plane of the target, ignore Y for state change trigger
+             const distanceToXZTarget = dronePosition.distanceTo(new THREE.Vector3(currentTargetPosition.x, dronePosition.y, currentTargetPosition.z));
+
+            if (!isAvoiding && distanceToXZTarget < MOVEMENT_THRESHOLD) {
+                // Reached lawnmower waypoint (XZ position), change state
+                dronePosition.copy(new THREE.Vector3(currentTargetPosition.x, dronePosition.y, currentTargetPosition.z)); // Snap XZ
+
+                if (currentMovementState === STATE.MOVING_X_POS || currentMovementState === STATE.MOVING_X_NEG) {
+                    currentMovementState = STATE.TURNING_Z;
+                    currentScanZ += SCAN_WIDTH;
+                    if (currentScanZ > FIELD_DEPTH / 2 + 0.01) { // Add tolerance
+                        currentMovementState = STATE.FINISHED;
+                        setNextLawnmowerTarget();
+                        return; // Stop movement updates
+                    }
+                } else if (currentMovementState === STATE.TURNING_Z) {
+                    // Determine next X direction based on which side we arrived at
+                     currentMovementState = (dronePosition.x > 0) ? STATE.MOVING_X_NEG : STATE.MOVING_X_POS;
+                }
+                setNextLawnmowerTarget();
+                // Re-calculate direction/distance for the NEW target immediately
+                effectiveTargetY = isAvoiding ? avoidanceTargetY : DRONE_HOVER_HEIGHT; // Check avoidance state again
+                targetPosThisFrame.set(currentTargetPosition.x, effectiveTargetY, currentTargetPosition.z);
+                directionToTarget.subVectors(targetPosThisFrame, dronePosition);
+                distanceToTarget = directionToTarget.length();
+            }
+
+
+            // 5. Move Towards Effective Target (incorporating avoidance height)
+            if (currentMovementState !== STATE.FINISHED && distanceToTarget > 1e-4) {
+                directionToTarget.normalize();
+                const moveStep = directionToTarget.multiplyScalar(DRONE_SPEED);
+
+                if (moveStep.length() >= distanceToTarget) {
+                     // Don't overshoot, snap to the target Y as well now
+                     dronePosition.copy(targetPosThisFrame);
+                } else {
+                    dronePosition.add(moveStep);
+                }
+            }
+
+            // Update mesh position
+            droneMesh.position.copy(dronePosition);
+
+            // 6. Update LookAt
+            const lookAtPoint = targetPosThisFrame.clone();
+            // Prevent looking straight down/up if target is directly above/below
+             if (Math.abs(lookAtPoint.x - dronePosition.x) < 1e-4 && Math.abs(lookAtPoint.z - dronePosition.z) < 1e-4) {
+                // If target is vertically aligned, look slightly forward based on state
+                 let forward = new THREE.Vector3();
+                 if (currentMovementState === STATE.MOVING_X_POS) forward.set(1,0,0);
+                 else if (currentMovementState === STATE.MOVING_X_NEG) forward.set(-1,0,0);
+                 else if (currentMovementState === STATE.TURNING_Z) forward.set(0,0,1);
+                 else forward.set(0,0,1); // Default forward if state is weird
+                 lookAtPoint.copy(dronePosition).add(forward);
+             }
+
+            if (lookAtPoint.distanceToSquared(dronePosition) > 1e-6) {
+                droneMesh.lookAt(lookAtPoint);
+            }
+        }
+
+
+        // --- SLAM Update Logic ---
+
+        function updateTrajectoryBuffer() {
+             if (trajectoryPointCount < MAX_TRAJECTORY_POINTS) {
+                const index = trajectoryPointCount * 3;
+                trajectoryPositions[index] = dronePosition.x;
+                trajectoryPositions[index + 1] = dronePosition.y;
+                trajectoryPositions[index + 2] = dronePosition.z;
+                trajectoryPointCount++;
+             }
+        }
+
+        function updateTrajectory() {
+            updateTrajectoryBuffer();
+            if (trajectoryPointCount > 0) {
+                trajectoryGeometry.attributes.position.needsUpdate = true;
+                trajectoryGeometry.setDrawRange(0, trajectoryPointCount);
+            }
+        }
+
+        function generateFeatures() {
+            const baseColor = new THREE.Color(0x228B22); // Forest Green features
+
+            for (let i = 0; i < FEATURE_GENERATION_RATE && featurePointCount < MAX_FEATURE_POINTS; i++) {
+                const index = featurePointCount * 3;
+
+                // Generate point randomly in a volume below and around the drone
+                const randomDirection = new THREE.Vector3(
+                    (Math.random() - 0.5) * 2,
+                    -Math.random() * 1.5, // Increase downward spread slightly
+                    (Math.random() - 0.5) * 2
+                ).normalize();
+
+                const randomDistance = Math.random() * FEATURE_RANGE;
+                const pointPos = dronePosition.clone().add(randomDirection.multiplyScalar(randomDistance));
+
+                // Add jitter
+                pointPos.x += (Math.random() - 0.5) * FEATURE_JITTER;
+                pointPos.y += (Math.random() - 0.5) * FEATURE_JITTER * 0.5;
+                pointPos.z += (Math.random() - 0.5) * FEATURE_JITTER;
+
+                // Check if point is inside an obstacle - if so, clamp Y to obstacle surface
+                let onObstacle = false;
+                for (const obs of obstacles) {
+                    const halfSize = obs.size.clone().multiplyScalar(0.5);
+                    const min = obs.position.clone().sub(halfSize);
+                    const max = obs.position.clone().add(halfSize);
+                     // Check XZ first
+                    if (pointPos.x >= min.x && pointPos.x <= max.x && pointPos.z >= min.z && pointPos.z <= max.z) {
+                         // If potentially above obstacle, clamp Y between bottom and top
+                         if (pointPos.y >= min.y && pointPos.y <= max.y + 0.1) { // Allow slightly above
+                             pointPos.y = Math.max(min.y, Math.min(max.y, pointPos.y)); // Clamp Y to obstacle height
+                             onObstacle = true;
+                             break; // Stop checking other obstacles
+                         }
+                     }
+                }
+
+                // If not on obstacle, clamp near ground plane
+                if (!onObstacle) {
+                    pointPos.y = Math.max(-0.05 + Math.random() * 0.1, pointPos.y);
+                    pointPos.y = Math.min(dronePosition.y * 0.9, pointPos.y); // Ensure below drone
+                }
+
+
+                featuresPositions[index] = pointPos.x;
+                featuresPositions[index + 1] = pointPos.y;
+                featuresPositions[index + 2] = pointPos.z;
+
+                // Color slightly differently if on obstacle (e.g., more grey/brownish)
+                const finalColor = onObstacle
+                    ? new THREE.Color(0x998877).offsetHSL(0, 0, (Math.random() - 0.5) * 0.2) // Brownish variation
+                    : baseColor.clone().offsetHSL(0, 0, (Math.random() - 0.5) * 0.3); // Greenish variation
+
+                featuresColors[index] = finalColor.r;
+                featuresColors[index + 1] = finalColor.g;
+                featuresColors[index + 2] = finalColor.b;
+
+
+                featurePointCount++;
+            }
+
+            if (featurePointCount > 0) {
+                featuresGeometry.attributes.position.needsUpdate = true;
+                featuresGeometry.attributes.color.needsUpdate = true;
+                featuresGeometry.setDrawRange(0, featurePointCount);
+            }
+        }
+
+
+        function checkForLoopClosure() {
+            if (currentMovementState !== STATE.TURNING_Z && currentMovementState !== STATE.FINISHED &&
+                !isAvoiding && // Don't check loops while actively avoiding
+                trajectoryPointCount > 100 && Math.random() < LOOP_CLOSURE_CHANCE) {
+                const lookbackMin = 50;
+                const pointsPerHalfScan = (FIELD_WIDTH / DRONE_SPEED) * 0.8;
+                const lookbackMax = Math.min(trajectoryPointCount - lookbackMin, Math.floor(pointsPerHalfScan * 3));
+
+                if (lookbackMax > lookbackMin) {
+                    const randomIndex = lookbackMin + Math.floor(Math.random() * (lookbackMax - lookbackMin));
+                    const oldPointIndex = (trajectoryPointCount - 1 - randomIndex) * 3;
+
+                    if (oldPointIndex >= 0) {
+                        const oldPos = new THREE.Vector3(
+                            trajectoryPositions[oldPointIndex],
+                            trajectoryPositions[oldPointIndex + 1],
+                            trajectoryPositions[oldPointIndex + 2]
+                        );
+                        if (dronePosition.distanceTo(oldPos) < SCAN_WIDTH * 2.0) { // Increased threshold slightly
+                            visualizeLoopClosure(dronePosition, oldPos);
+                        }
+                    }
+                }
+            }
+        }
+
+        function visualizeLoopClosure(pos1, pos2) {
+            const linePoints = [pos1, pos2];
+            const geometry = new THREE.BufferGeometry().setFromPoints(linePoints);
+            const material = new THREE.LineBasicMaterial({ color: 0xff00ff, linewidth: 3 }); // Magenta
+            const line = new THREE.Line(geometry, material);
+            loopClosureGroup.add(line);
+            setTimeout(() => {
+                if (loopClosureGroup.children.includes(line)) {
+                    loopClosureGroup.remove(line);
+                    geometry.dispose();
+                    material.dispose();
+                }
+            }, 2500);
+        }
+
+
+        // --- UI Update ---
+        function updateUI() {
+            if (frameCountElement && robotPositionElement && featureCountElement) {
+                frameCountElement.textContent = frameCounter;
+                robotPositionElement.textContent = `(${dronePosition.x.toFixed(2)}, ${dronePosition.y.toFixed(2)}, ${dronePosition.z.toFixed(2)})`;
+                featureCountElement.textContent = featurePointCount;
+            }
+        }
+
+        // --- Animation Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const deltaTime = clock.getDelta();
+            frameCounter++;
+
+            // Update Drone Movement (State Machine + Avoidance)
+            updateDroneMovement(deltaTime);
+
+            // Update SLAM Data
+            updateTrajectory();
+            generateFeatures(); // Now generates features on obstacles too
+            checkForLoopClosure();
+
+            // Update UI
+            updateUI();
+
+            // Update Controls
+            controls.update();
+
+            // Render Scene
+            renderer.render(scene, camera);
+        }
+
+        // --- Event Handlers ---
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // --- Start ---
+        init();
+
+    </script>
+</body>
+</html>
